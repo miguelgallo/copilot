@@ -139,17 +139,27 @@ def get_data(fileNames, selection=None, version="V1"):
     # Verificações iniciais
     if version not in ("V1", "V2"):
         raise ValueError(f"Unsupported version: {version}")
-    
+
     # Configuração inicial de listas para armazenar os DataFrames
     df_list = [] if version == "V1" else []
     chunk_size = 1000000
 
+    # Inicialize os contadores e DataFrames
+    df_counts = None
+    df_protons_multiRP = None
+    df_protons_singleRP = None
+
     for file_ in fileNames:
         with h5py.File(file_, 'r') as f:
-            # Carrega o conjunto de dados principal e as colunas
-            dset = f['protons'] if version == "V1" else f['protons_multiRP']
+            # Carrega diferentes grupos de dados dependendo da versão
+            if version == "V1":
+                dset = f['protons']
+            elif version == "V2":
+                dset = f['protons_multiRP']
+                singleRP_dset = f.get('protons_singleRP', None)  # Use get para evitar erro se o grupo não existir
+
             columns = [item.decode("utf-8") for item in f['columns']]
-            
+
             # Itera em chunks para evitar sobrecarga de memória
             for idx in range(0, dset.shape[0], chunk_size):
                 data_chunk = dset[idx: idx + chunk_size]
@@ -160,18 +170,29 @@ def get_data(fileNames, selection=None, version="V1"):
                     pl.col(col).cast(pl.Int64) if col in ['Run', 'LumiSection', 'EventNum'] else pl.col(col)
                     for col in columns
                 ])
-                
+
                 # Aplica a seleção, se fornecida
                 if selection:
                     df_chunk = selection(df_chunk)
-                
+
                 # Adiciona o chunk processado à lista
                 df_list.append(df_chunk)
-    
-    # Concatena todos os chunks processados em um único DataFrame
-    df = pl.concat(df_list)
-    return df
 
+            # Carrega o DataFrame para SingleRP, se disponível
+            if singleRP_dset is not None:
+                singleRP_columns = f.get('columns_singleRP', None)
+                if singleRP_columns is not None:
+                    singleRP_columns = [item.decode("utf-8") for item in singleRP_columns]
+                    singleRP_data = pl.DataFrame({col: singleRP_dset[:, i] for i, col in enumerate(singleRP_columns)})
+                    df_protons_singleRP = singleRP_data if df_protons_singleRP is None else pl.concat([df_protons_singleRP, singleRP_data])
+
+    # Concatena todos os chunks processados em um único DataFrame
+    df_protons_multiRP = pl.concat(df_list)
+
+    # Simula um DataFrame de contagens (exemplo)
+    df_counts = pl.DataFrame({"count": [len(df_protons_multiRP)]})
+
+    return df_counts, df_protons_multiRP, df_protons_singleRP
 
 # Função para aplicar cortes fiduciais a todas as amostras de dados
 def fiducial_cuts_all(data_sample):
@@ -563,7 +584,6 @@ def handle_efficiencies(df_protons_multiRP_events, df_protons_multiRP_index_2pro
 
     return df_protons_multiRP_events
 
-
 # Função para processar eventos para MultiRP (com suporte a 2 prótons)
 def process_events_with_2protons(df_protons_multiRP_index, data_sample, runOnMC):
     # Seleciona eventos válidos com dois prótons
@@ -572,9 +592,9 @@ def process_events_with_2protons(df_protons_multiRP_index, data_sample, runOnMC)
         .groupby(['Run', 'LumiSection', 'EventNum', 'Slice'])
         .agg(pl.col("Arm").sort().alias("sorted_arms"))
         .filter(
-            (pl.col("sorted_arms").list.lengths() == 2) &
-            (pl.col("sorted_arms").list.contains(0)) &
-            (pl.col("sorted_arms").list.contains(1))
+            (pl.col("sorted_arms").list.lengths() == 2) &  # Garante que contenha exatamente 2 elementos
+            (pl.col("sorted_arms").list.contains(0)) &  # Valida que contém 0
+            (pl.col("sorted_arms").list.contains(1))    # Valida que contém 1
         )
     )
 
@@ -584,6 +604,11 @@ def process_events_with_2protons(df_protons_multiRP_index, data_sample, runOnMC)
         on=['Run', 'LumiSection', 'EventNum', 'Slice'],
         how="inner"
     )
+
+    # Certifique-se de que a coluna 'Xi' seja convertida corretamente em uma lista de tipo Float32
+    df_protons_multiRP_index_2protons = df_protons_multiRP_index_2protons.with_columns([
+        pl.col("Xi").cast(pl.Float32).apply(lambda x: [x], return_dtype=pl.List(pl.Float32))  # Converte para Float32 antes de encapsular em lista
+    ])
 
     # Calcula variáveis derivadas (MX e YX)
     df_protons_multiRP_events = (
@@ -600,4 +625,3 @@ def process_events_with_2protons(df_protons_multiRP_index, data_sample, runOnMC)
     )
 
     return df_protons_multiRP_events
-
